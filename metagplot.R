@@ -1,5 +1,4 @@
-Certainly! Below is the updated script with the exact values for the parameters you provided:
-  
+ 
   ### Updated R Script with Parameter Values
   
   ```r
