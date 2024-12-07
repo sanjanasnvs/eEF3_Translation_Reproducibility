@@ -200,5 +200,286 @@ echo "Alignment done!"
 
 ```
 
+**SAM to BAM, and Indexing of the BAM files**
+
+```{bash}
+#!/bin/bash
+
+# convert SAM to BAM, sort, index
+
+    
+# File paths
+Input_SAM="/scratch_tmp/grp/msc_appbio/group12/outputs/hisat2_alignment"
+Output_BAM="/scratch_tmp/grp/msc_appbio/group12/outputs/hisat2_alignment/hisat2_BAM"
+    
+for SAM_FILE in "$Input_SAM"/*.sam; do
+    #Extract the basename from the .sam files
+    BASE_NAME=$(basename "$SAM_FILE" .sam)
+    #Define the bam file path
+    BAM_FILE="$Output_BAM/$BASE_NAME.bam"
+    #Define the bam.bai file path
+    BAM_INDEX="$Output_BAM/$BASE_NAME.bam.bai"
+    
+    
+    # Step 1: Convert SAM to BAM and sort
+    echo "Sorting and converting ${SAM_FILE} to ${BAM_FILE}..."
+    
+    samtools sort -m 4G -@ 4 -o "${BAM_FILE}" "${SAM_FILE}"
+    
+    # Step 2: Index the BAM file
+    echo "Indexing ${BAM_FILE}..."
+    samtools index "${BAM_FILE}"
+    
+done
+
+echo "All conersions, sorting and indexing complete!"
+
+```
+
+RawAssignment function 
+
+```{bash}
+#!/usr/bin/env Rscript
+#installing packages
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("Rsamtools")
+library(Rsamtools)
+
+install.packages("dplyr")
+install.packages("data.table")
+
+
+library(dplyr)
+library(data.table)
+
+Params <- list(MappedTwice = "No", ReadLenMin = 25, ReadLenMax = 35, Mapping = "5")
+
+#list of bam files without extensions
+Names <- c("ERR2660267_subtracted_aligned", "ERR2660263_subtracted_aligned","ERR2660262_subtracted_aligned","ERR2660266_subtracted_aligned")
+
+#function to process bam files
+rawAssignment <- function(Names, Params) {
+  for (sample in Names) {
+    bam_file <- paste0("/scratch_tmp/grp/msc_appbio/group12/outputs/hisat2_alignment/hisat2_BAM/", sample, ".bam")
+    bam <- BamFile(bam_file)
+    open(bam)
+    
+    read_len_min <- as.numeric(Params$ReadLenMin)
+    read_len_max <- as.numeric(Params$ReadLenMax)
+    mapping <- Params$Mapping
+
+    log_file <- file(paste0("/scratch_tmp/grp/msc_appbio/group12/outputs/AssignmentRaw/Reports/", sample, "_log.txt"), "w")
+    writeLines(paste("Processing sample:", sample), log_file)
+
+    # Read BAM and extract aligned reads
+    param <- ScanBamParam(what = c("pos", "qwidth", "strand"), tag = "NH")
+    aln <- scanBam(bam, param = param)
+
+    reads <- data.frame(
+      position = unlist(aln[[1]]$pos),
+      read_length = unlist(aln[[1]]$qwidth),
+      strand = unlist(aln[[1]]$strand),
+      NH = unlist(aln[[1]]$tag$NH)
+    )
+
+    # Filter reads by NH tag
+    reads <- reads %>% filter(NH == 1 | (NH == 2 & Params$MappedTwice == "Yes"))
+
+    # Count reads by read length and strand
+    forward_reads <- reads %>% filter(strand == "+") %>%
+      group_by(read_length) %>%
+      summarize(count = n())
+
+    reverse_reads <- reads %>% filter(strand == "-") %>%
+      group_by(read_length) %>%
+      summarize(count = n())
+
+    # Save raw counts
+    fwrite(forward_reads, paste0("/scratch_tmp/grp/msc_appbio/group12/outputs/AssignmentRaw/", sample, "_raw_Forward.txt"), sep = "\t")
+    fwrite(reverse_reads, paste0("/scratch_tmp/grp/msc_appbio/group12/outputs/AssignmentRaw/", sample, "_raw_Reverse.txt"), sep = "\t")
+
+    # Compute RPM normalization factor
+    norm_factor <- nrow(reads) / 1e6
+    forward_reads$count <- forward_reads$count / norm_factor
+    reverse_reads$count <- reverse_reads$count / norm_factor
+
+    # Save normalized counts
+    fwrite(forward_reads, paste0("/scratch_tmp/grp/msc_appbio/group12/outputs/AssignmentRaw/", sample, "_rpm_Forward.txt"), sep = "\t")
+    fwrite(reverse_reads, paste0("/scratch_tmp/grp/msc_appbio/group12/outputs/AssignmentRaw/", sample, "_rpm_Reverse.txt"), sep = "\t")
+
+    # Log statistics
+    total_reads <- nrow(reads)
+    unique_reads <- nrow(filter(reads, NH == 1))
+    mapped_twice <- nrow(filter(reads, NH == 2))
+
+    writeLines(sprintf("Total reads: %d", total_reads), log_file)
+    writeLines(sprintf("Uniquely mapped reads: %d", unique_reads), log_file)
+    writeLines(sprintf("Reads mapped twice: %d", mapped_twice), log_file)
+
+    close(log_file)
+    close(bam)
+  }
+}
+
+# Run the function on the two files
+rawAssignment(Names, Params)
+```
+
+# **Differential Gene Expression, effects of eEF3 depletion on gene expression**
+
+Reproducing Figure 3 in the paper. 
+
+## Step 1: install cufflinks on the HPC
+
+```{bash}
+#To fix the version clashes 
+conda create -n cufflinks-env python=3.6
+
+conda activate cufflinks-env
+
+conda install -c bioconda -c conda-forge cufflinks
+```
+
+## Step 2: Write the script to Make counts files
+Testing cuffquant on one file 
+```{bash}
+
+cuffquant -p 4 -o /scratch_tmp/grp/msc_appbio/group12/outputs/DGE/counts/depleted/ -u -b /scratch_tmp/grp/msc_appbio/group12/references/Genome.fa  /scratch_tmp/grp/msc_appbio/group12/references/Genome.gtf /scratch_tmp/grp/msc_appbio/group12/outputs/hisat2_alignment/hisat2_BAM/ERR2660267_subtracted_aligned.bam
+
+
+```
+Creating the counts with Cuffquant
+```{bash}
+#!/bin/bash
+
+# Variables
+input_bam="/scratch_tmp/grp/msc_appbio/group12/outputs/hisat2_alignment/hisat2_BAM"
+gtf_file="/scratch_tmp/grp/msc_appbio/group12/references/Genome.gtf"
+fasta_file="/scratch_tmp/grp/msc_appbio/group12/references/Genome.fa"
+output_dir="/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/counts/depleted/"
+
+# Loop through all BAM files in the directory
+for bam_file in ${input_bam_directory}/*.bam; do
+    # Extract the base name (e.g., "ERR2660267" from "ERR2660267_subtracted_aligned.bam")
+    base_name=$(basename "$bam_file" "_subtracted_aligned.bam")
+
+    # Create the output directory for this run
+    output_subdir="${output_dir}${base_name}"
+    mkdir -p "$output_subdir"
+    # Run Cuffquant for this BAM file
+    cuffquant -p 4 -o ${output_dir}${base_name} -u -b $fasta_file $gtf_file $bam_file
+
+    # Rename the output file to match the base name
+    mv "${output_subdir}/abundances.cxb" "${output_subdir}/${base_name}_abundances.cxb"
+done
+
+```
+#**Cuffdiff** 
+##RiboSeq
+```{bash}
+#!/bin/bash
+
+# Paths to the counts files
+output_file="/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/diffgene/RiboSeq"
+gtf_file="/scratch_tmp/grp/msc_appbio/group12/references/Genome.gtf"
+
+depleted_1="/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/counts/RiboSeq/depleted/ERR2660266/ERR2660266_abundances.cxb"
+depleted_2="/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/counts/RiboSeq/depleted/ERR2660267/ERR2660267_abundances.cxb"
+normal_1="/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/counts/RiboSeq/normal/ERR2660262/ERR2660262_abundances.cxb"
+normal_2="/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/counts/RiboSeq/normal/ERR2660263/ERR2660263_abundances.cxb"
+
+# Labels for conditions
+normal_label="Normal"
+depleted_label="Depleted"
+
+# Create output directory if it doesn't exist
+mkdir -p $output_file
+
+# Run Cuffdiff
+cuffdiff -o $output_file -L $normal_label,$depleted_label -p 4 -F 0.05 $gtf_file $normal_1,$normal_2 $depleted_1,$depleted_2
+
+
+# Notify user of completion and location of results
+echo "Differential expression analysis complete."
+echo "Results saved in: $output_file"
+"
+
+
+
+
+```
+
+
+#Plotting the differential expression data
+
+```{r}
+#!/usr/bin/env Rscript
+#Import tidyverse
+library(tidyverse)
+
+#Load the differential expression data
+df = read.table("/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/diffgene/RiboSeq/gene_exp.diff",sep='\t',header=T)
+
+df=rename(df,log2.fold_change=log2.fold_change.) #rename the column to simplify coding
+
+#Filter the low read counts as they did in the paper
+filtered_data = df %>%
+  mutate(
+    log_value_1 = log2(value_1),
+    log_value_2 = log2(value_2)
+  ) %>%
+  filter(log_value_1 >= 4 & log_value_1 <= 18, 
+         log_value_2 >= 4 & log_value_2 <= 18,
+         q_value <= 0.05)  # Filter based on q_value <= 0.05
+#Calculate the number of DGEs
+upregulated_count = filtered_data %>%
+  filter(log2.fold_change > 1.25) %>%
+  count()
+downregulated_count = filtered_data %>%
+  filter(log2.fold_change < -1.25) %>%
+  count() 
+# Create the scatter plot
+plot = ggplot(filtered_data, aes(x = log_value_1, y = log_value_2)) +
+  # Add points, color based on log2.fold_change values
+  geom_point(aes(color = ifelse(log2.fold_change > 1.25, "#d3301e", 
+                                ifelse(log2.fold_change < -1.25, "#454ea2", "black"))),size=5) +
+  scale_color_identity() + # Use color values as is (no scaling)
+  labs(
+    x = "log2(RPKM)",
+    y = "log2(RPKM)",
+    title = "RiboSeq_ORF"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid = element_blank(), # Removes the grid
+    axis.line = element_line(color = "black", size = 1.5), 
+    axis.ticks = element_line(color = "black", size = 1.5),  
+    axis.ticks.length = unit(0.3, "cm"),
+    axis.text = element_text(size = 12)
+  )
+
+plot = plot + 
+  annotate("text", x = 5, y = 16, 
+           label = paste(upregulated_count, "↑"), 
+           color = "#d3301e", hjust = 0,size=5) +
+  annotate("text", x = 16, y = 5, 
+           label = paste(downregulated_count, "↓"), 
+           color = "#454ea2", hjust = 0,size=5) #add number of DGEs annotations
+
+plot = plot +
+  annotate("text", x = 17, y = 4, label = "0.0 mM Met", color = "black", hjust = 1, angle = 0,size=5) +
+  annotate("text", x = 4, y = 14, label = "0.5 mM Met", color = "black", vjust = 1, angle = 90,size=5) #Add condition annotations
+
+plot = plot +
+  scale_x_continuous(breaks = seq(4, 18, by = 2)) +
+  scale_y_continuous(breaks = seq(4, 18, by = 2))
+print(plot) #Change the tick frequency
+
+ggsave("/scratch_tmp/grp/msc_appbio/group12/outputs/DGE/plots/RiboSeqhigh_quality_plot.png", plot = plot, width = 8, height = 8, dpi = 300) #Save the plot
+```
+
 
 
